@@ -4,6 +4,12 @@ services:
     image: volume-recovery:dev
     ports:
       - "8080:5000"
+    environment:
+      # 演示用小卷 + 短回填间隔,慢读竞争窗口可稳定复现;
+      # 镜像在构建期按 256 块生成,运行时只用前 32 块,内容仍可由块号推导。
+      BLOCK_COUNT: "32"
+      BLOCK_SIZE: "4096"
+      BACKFILL_DELAY: "0.02"
     volumes:
       - recovery-data:/data
     restart: unless-stopped

@@ -71,9 +71,12 @@
     <div class="card"><div class="num" id="c-progress">-</div><div class="lbl">恢复进度</div></div>
     <div class="card"><div class="num" id="c-backfill">-</div><div class="lbl">回填状态</div></div>
     <div class="card"><div class="num" id="c-backup">-</div><div class="lbl">备份连接</div></div>
+    <div class="card"><div class="num" id="c-inflight">-</div><div class="lbl">在途备份读</div></div>
     <div class="card"><div class="num" id="c-breads">-</div><div class="lbl">备份读取次数</div></div>
     <div class="card"><div class="num" id="c-bwrites">-</div><div class="lbl">业务写入次数</div></div>
     <div class="card"><div class="num" id="c-late">-</div><div class="lbl">迟到数据丢弃</div></div>
+    <div class="card"><div class="num" id="c-localwait">-</div><div class="lbl">等后改取本地</div></div>
+    <div class="card"><div class="num" id="c-stale">-</div><div class="lbl">重置后旧读作废</div></div>
   </div>
   <div class="bar"><div id="bar-fill"></div></div>
 
@@ -100,6 +103,13 @@
       <div id="sel-info">未选中块</div>
       <div class="row">
         <button id="btn-read" class="ghost">读取</button>
+        <button id="btn-slowread" class="ghost">慢读(模拟备份慢响应)</button>
+        <label style="font-size:13px;color:#55617a">慢读秒数
+          <input id="slow-delay" type="number" min="0" max="120" step="0.5" value="5"
+                 style="width:70px;padding:4px;border:1px solid #c4ccd9;border-radius:6px">
+        </label>
+      </div>
+      <div class="row">
         <button id="btn-susp" class="warn">挂起备份读</button>
         <button id="btn-resume" class="ghost">放行备份读</button>
       </div>
@@ -113,11 +123,17 @@
 
   <div class="demo">
     <h2>演示脚本</h2>
-    <p>一键演示:重置卷 → 挂起块 7 → 启动回填 → 挂起期间读块 7 被拒 / 整块写入成功 →
+    <p>① 基础演示:重置卷 → 挂起块 7 → 启动回填 → 挂起期间读块 7 被拒 / 整块写入成功 →
        缺块时断开备份被拒 → 放行块 7 → 等待补齐 → 块 7 仍是业务数据(迟到备份数据未覆盖)→
        断开备份 → 断开后读写正常。</p>
-    <button id="btn-demo">▶ 运行演示</button>
-    <button id="btn-clearlog" class="ghost">清空日志</button>
+    <p>② 慢读竞争演示:重置卷 → 对块 7 发起慢读 → 慢读期间整块写入补齐块 7 并回填其余块 →
+       不等待慢读直接断开成功 → 新读只走本地 → 旧慢读返回的是本地新数据而非备份旧内容 →
+       再发慢读并在等待期重置卷(且重写同号块)→ 旧读返回 409 提示重试,新读正常。</p>
+    <div class="row">
+      <button id="btn-demo">▶ 运行演示①(挂起/回填/断开)</button>
+      <button id="btn-demo2" class="warn">▶ 运行演示②(慢读补齐/断开/重置作废)</button>
+      <button id="btn-clearlog" class="ghost">清空日志</button>
+    </div>
     <pre id="demolog">(演示日志)</pre>
   </div>
 </main>
@@ -149,9 +165,12 @@ async function refresh() {
   $("#c-progress").textContent = st.progress + "%";
   $("#c-backfill").textContent = st.backfill_complete ? "已完成" : (st.backfill_running ? "回填中" : "未运行");
   $("#c-backup").textContent = st.backup_disconnected ? "已断开" : "已连接";
+  $("#c-inflight").textContent = st.inflight_backup_reads + (st.backup_fd_open ? "" : "(句柄已释放)");
   $("#c-breads").textContent = st.stats.backup_reads;
   $("#c-bwrites").textContent = st.stats.business_writes;
   $("#c-late").textContent = st.stats.late_ignored;
+  $("#c-localwait").textContent = st.stats.local_after_wait;
+  $("#c-stale").textContent = st.stats.stale_rejected;
   $("#bar-fill").style.width = st.progress + "%";
   renderGrid();
   renderSelInfo();
@@ -217,6 +236,26 @@ $("#btn-read").onclick = async () => {
   $("#blkresult").textContent = j._status === 200
     ? `块 ${j.idx} 来源=${j.source}${j.origin ? "/" + j.origin : ""} 大小=${j.size}B\n内容预览: ${j.text}`
     : `HTTP ${j._status}: ${j.message}`;
+};
+$("#btn-slowread").onclick = async () => {
+  if (selected === null) return;
+  const delay = Number($("#slow-delay").value) || 0;
+  const btn = $("#btn-slowread");
+  btn.disabled = true;
+  const t0 = Date.now();
+  try {
+    // 不 await 卡死界面:慢读期间值班员仍可写入/断开/重置并观察在途计数
+    const p = api(`/api/block/${selected}?delay=${delay}`);
+    $("#blkresult").textContent = `块 ${selected} 慢读已发出(模拟备份 ${delay}s),期间可写入补齐或断开/重置 ...`;
+    const j = await p;
+    const ms = ((Date.now() - t0) / 1000).toFixed(1);
+    $("#blkresult").textContent = j._status === 200
+      ? `[耗时 ${ms}s] 块 ${j.idx} 来源=${j.source}${j.origin ? "/" + j.origin : ""} 大小=${j.size}B\n内容预览: ${j.text}`
+      : `[耗时 ${ms}s] HTTP ${j._status}: ${j.message}`;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
 };
 $("#btn-write").onclick = async () => {
   if (selected === null) return;
@@ -287,11 +326,90 @@ $("#btn-demo").onclick = async () => {
     r = await api("/api/block/3/write", "POST", { data: "POST-DISCONNECT-WRITE" });
     r = await api("/api/block/3");
     slog(`12. 断开后改写块 3 再读 → "${r.text}" ✔ 数据盘仍可读写`);
-    slog("=== 演示完成 ===");
+    slog("=== 演示①完成 ===");
   } catch (e) {
     slog("✘ 演示异常: " + e);
   } finally {
     btn.disabled = false;
+    refresh();
+  }
+};
+
+$("#btn-demo2").onclick = async () => {
+  const btn = $("#btn-demo2");
+  btn.disabled = true;
+  $("#btn-demo").disabled = true;
+  const B = 7, B2 = 9, DELAY = 8;
+  try {
+    slog("=== 演示②开始:慢读补齐 / 断开 / 重置作废 ===");
+    let j = await api("/api/reset", "POST");
+    slog("0. " + j.message);
+
+    // 对缺块 7 发起慢读(不 await),让它先占住在途备份读
+    const t0 = Date.now();
+    const p1 = api(`/api/block/${B}?delay=${DELAY}`);
+    await new Promise(r => setTimeout(r, 600));
+    let st = await refresh();
+    slog(`1. 块 ${B} 慢读(delay=${DELAY}s)已在途:在途备份读=${st.inflight_backup_reads} ✔`);
+
+    // 慢读期间:先业务整块写入补齐块 7(保证慢读回来命中本地业务数据),
+    // 再启动回填补齐其余块——写入与回填都不需要等待慢读
+    const payload = `FRESH-BUSINESS block ${B} @ ${new Date().toLocaleTimeString()}`;
+    j = await api(`/api/block/${B}/write`, "POST", { data: payload });
+    slog(`2. 慢读等待期间对块 ${B} 整块写入补齐 → HTTP ${j._status} ✔(写入不被慢读阻塞)`);
+    j = await api("/api/backfill/start", "POST");
+    slog("3. 慢读等待期间启动回填补齐其余块 → " + j.message);
+    const done = await waitUntil(s => s.missing === 0, 60000);
+    if (!done) { slog("✘ 等待补齐超时"); return; }
+
+    // 块补齐后立即断开,不等慢读
+    j = await api("/api/disconnect", "POST");
+    st = await refresh();
+    slog(`4. 不等待慢读直接断开 → HTTP ${j._status}: ${j.message}`);
+    slog(`   此刻在途备份读=${st.inflight_backup_reads},备份连接=${st.backup_disconnected ? "已断开" : "已连接"} ✔(断开不阻塞)`);
+
+    // 断开后的新读只访问本地
+    let r = await api(`/api/block/${B}`);
+    slog(`5. 断开后新读块 ${B} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔(只访问本地)`);
+
+    // 等旧慢读回来:必须是本地业务数据,而不是备份里的旧内容
+    r = await p1;
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    if (r._status === 200 && r.source === "local" && r.origin === "business" && r.text === payload) {
+      slog(`6. 旧慢读返回(耗时 ${secs}s)→ 来源=local/business 内容="${r.text}" ✔ 未返回备份旧内容`);
+    } else {
+      slog(`✘ 旧慢读结果不符合预期: HTTP ${r._status} ${JSON.stringify(r)}`);
+    }
+    st = await refresh();
+    slog(`7. 在途读结束后:在途=${st.inflight_backup_reads},镜像句柄${st.backup_fd_open ? "仍打开 ✘" : "已释放 ✔"}`);
+
+    // 重置场景:等待期间重置卷,即使同号块重写,旧读也要提示重试
+    await api("/api/reset", "POST");
+    const t1 = Date.now();
+    const p2 = api(`/api/block/${B2}?delay=6`);
+    await new Promise(r => setTimeout(r, 600));
+    st = await refresh();
+    slog(`8. 重置后对缺块 ${B2} 再发慢读:在途=${st.inflight_backup_reads}`);
+    j = await api("/api/reset", "POST");
+    slog("9. 慢读等待期间重置卷 → " + j.message);
+    j = await api(`/api/block/${B2}/write`, "POST", { data: "REWRITTEN-AFTER-RESET" });
+    slog(`10. 重置后重新整块写入同号块 ${B2} → HTTP ${j._status}`);
+    r = await p2;
+    if (r._status === 409 && /重置/.test(r.message)) {
+      slog(`11. 旧慢读返回(耗时 ${((Date.now() - t1) / 1000).toFixed(1)}s)→ HTTP 409: ${r.message} ✔ 旧请求已作废并提示重试`);
+    } else {
+      slog(`✘ 旧读未按 stale 处理: HTTP ${r._status} ${JSON.stringify(r)}`);
+    }
+    r = await api(`/api/block/${B2}`);
+    slog(`12. 重新发起读取块 ${B2} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔ 新读正常`);
+    st = await refresh();
+    slog(`   统计:等后改取本地=${st.stats.local_after_wait} 重置后旧读作废=${st.stats.stale_rejected}`);
+    slog("=== 演示②完成 ===");
+  } catch (e) {
+    slog("✘ 演示异常: " + e);
+  } finally {
+    btn.disabled = false;
+    $("#btn-demo").disabled = false;
     refresh();
   }
 };
